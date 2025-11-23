@@ -3,33 +3,30 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Strength Tracker V4</title>
+    <title>Strength Tracker V6</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, setDoc, collection, query, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         
-        setLogLevel('Debug');
-
         // --- GLOBAL VARIABLES & CONSTANTS ---
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-        const API_KEY = ""; // Placeholder for Gemini API Key
 
-        let db;
-        let auth;
+        let db = null; 
+        let auth = null; 
         let userId = null;
         let isAuthReady = false;
 
-        // REST TIMER STATE
+        // --- DRAG AND DROP STATE ---
+        let dragStartIndex = -1;
+
+        // --- TIMER STATE ---
         let restTimerInterval = null;
         let restTimeSeconds = 90; 
         const MAX_REST_TIME = 90;
-
-        // TOTAL WORKOUT CHRONOMETER STATE
         let workoutTimerInterval = null;
         let totalTimeSeconds = 0;
 
@@ -55,8 +52,9 @@
         };
 
         let EXERCISE_LIBRARY = {}; // BASE_EXERCISE_LIBRARY + Custom Exercises
+        let CUSTOM_PRESETS = {}; // User-defined workout routines
 
-        const PRESETS = {
+        const BASE_PRESETS = {
             'Full Body': ['Goblet Squat', 'Dumbbell Bench Press', 'Lat Pulldown', 'Dumbbell Romanian Deadlift (RDL)', 'Dumbbell Shoulder Press', 'Cable Row (Seated)', 'Plank (Seconds)'],
             'Push': ['Dumbbell Bench Press', 'Dumbbell Shoulder Press', 'Cable Triceps Pushdown', 'Leg Press', 'Plank (Seconds)'],
             'Pull': ['Lat Pulldown', 'Cable Row (Seated)', 'Face Pulls', 'Dumbbell Romanian Deadlift (RDL)', 'Dumbbell Bicep Curl'],
@@ -73,23 +71,29 @@
             exercises: []
         };
         let workoutHistory = [];
-
-        // State to track which exercise cards are currently expanded/collapsed
-        // Key: Exercise Index, Value: Boolean (true for expanded)
         let exerciseCollapseState = {};
-
 
         // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
         async function initializeFirebase() {
+            // Check if Firebase config is missing (EXPECTED in local file mode)
             if (Object.keys(firebaseConfig).length === 0) {
-                document.getElementById('app-status').textContent = "Error: Firebase configuration missing.";
-                return;
-            }
+                userId = 'local-user-id-' + crypto.randomUUID().slice(0, 8);
+                isAuthReady = true;
+                document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                document.getElementById('app-status').textContent = "Local Mode (No History/Sync)";
 
+                EXERCISE_LIBRARY = { ...BASE_EXERCISE_LIBRARY }; 
+                
+                renderSidebarContent();
+                startNewSession('Full Body'); 
+                return; 
+            } 
+            
+            // --- STANDARD FIREBASE INIT ---
             const app = initializeApp(firebaseConfig);
             db = getFirestore(app);
             auth = getAuth(app);
-            
+
             try {
                 if (initialAuthToken) {
                     await signInWithCustomToken(auth, initialAuthToken);
@@ -99,38 +103,84 @@
             } catch (error) {
                 console.error("Firebase Auth failed:", error);
                 document.getElementById('app-status').textContent = "Auth Error: See console.";
-                return;
             }
-
+            
             onAuthStateChanged(auth, async (user) => {
-                if (user) {
-                    userId = user.uid;
-                    isAuthReady = true;
-                    document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
-                    document.getElementById('app-status').textContent = "Ready";
-                    
-                    // 1. Initialize EXERCISE_LIBRARY with base exercises
-                    EXERCISE_LIBRARY = { ...BASE_EXERCISE_LIBRARY }; 
-                    
-                    // 2. Load custom exercises from Firestore and merge
-                    await loadCustomExercises(); 
-                    
-                    // 3. Initialize UI
-                    renderSidebarContent(); // Render sidebar with fresh exercise list
-                    startNewSession('Full Body'); 
-                    loadHistory();
-
-                } else {
-                    isAuthReady = false;
-                    userId = null;
-                    document.getElementById('app-status').textContent = "Awaiting Authentication...";
-                }
+                userId = user.uid;
+                isAuthReady = true;
+                document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                document.getElementById('app-status').textContent = "Ready";
+                
+                EXERCISE_LIBRARY = { ...BASE_EXERCISE_LIBRARY }; 
+                await loadCustomExercises(); 
+                await loadCustomPresets();
+                
+                renderSidebarContent(); 
+                startNewSession('Full Body'); 
+                loadHistory(); 
             });
         }
 
-        // --- DATA INTERACTION (Custom Exercises) ---
+        // --- DATA INTERACTION (Presets & History) ---
+
+        async function loadCustomPresets() {
+            if (!isAuthReady || !db) return;
+
+            const collectionRef = collection(db, `artifacts/${appId}/users/${userId}/custom_presets`);
+            try {
+                const querySnapshot = await getDocs(query(collectionRef));
+                const customP = {};
+                querySnapshot.forEach((doc) => {
+                    const data = doc.data();
+                    customP[doc.id] = data.exercises; 
+                });
+                CUSTOM_PRESETS = customP;
+            } catch (error) {
+                console.error("Error loading custom presets:", error);
+            }
+        }
+        
+        async function saveCustomPreset(name) {
+            if (!isAuthReady || !currentWorkout.exercises.length) {
+                showMessage("Cannot save empty workout as a preset.", 'error');
+                return;
+            }
+            if (!db) {
+                showMessage("Database not initialized. Cannot save preset in Local Mode.", 'error');
+                return;
+            }
+            
+            const sanitizedName = name.trim();
+            if (sanitizedName === "") {
+                showMessage("Preset name cannot be empty.", 'error');
+                return;
+            }
+
+            const exerciseNames = currentWorkout.exercises.map(ex => ex.name);
+
+            try {
+                const docRef = doc(db, `artifacts/${appId}/users/${userId}/custom_presets`, sanitizedName);
+                await setDoc(docRef, { exercises: exerciseNames });
+                
+                CUSTOM_PRESETS[sanitizedName] = exerciseNames;
+                
+                showMessage(`Custom preset '${sanitizedName}' saved!`, 'success');
+                document.getElementById('new-preset-name').value = '';
+                renderSidebarContent(); 
+
+            } catch (error) {
+                console.error("Error saving custom preset:", error);
+                showMessage("Error saving custom preset. See console.", 'error');
+            }
+        }
+
+        window.handleSavePreset = () => {
+            const name = document.getElementById('new-preset-name').value;
+            saveCustomPreset(name);
+        };
+
         async function loadCustomExercises() {
-            if (!isAuthReady) return;
+            if (!isAuthReady || !db) return; 
 
             const collectionRef = collection(db, `artifacts/${appId}/users/${userId}/custom_exercises`);
             try {
@@ -138,7 +188,7 @@
                 const customEx = {};
                 querySnapshot.forEach((doc) => {
                     const data = doc.data();
-                    customEx[doc.id] = data; // doc.id is the exercise name
+                    customEx[doc.id] = data; 
                 });
                 
                 Object.assign(EXERCISE_LIBRARY, customEx);
@@ -150,7 +200,11 @@
 
         async function saveCustomExercise(name, goal, isTimed, type) {
             if (!isAuthReady) {
-                showMessage("Authentication not ready. Cannot save custom exercise.", 'error');
+                showMessage("App not ready. Cannot save custom exercise.", 'error');
+                return;
+            }
+            if (!db) {
+                showMessage("Database not initialized. Cannot save custom exercise in Local Mode.", 'error');
                 return;
             }
             
@@ -166,7 +220,7 @@
 
             const newExercise = {
                 goal: goal || "Custom goal",
-                type: type || "Custom",
+                type: type || "Misc",
                 isTimed: isTimed,
             };
             
@@ -193,7 +247,6 @@
             }
         }
         
-        // Function called from the custom exercise form
         window.handleCreateCustomExercise = () => {
             const name = document.getElementById('custom-exercise-name').value;
             const goal = document.getElementById('custom-exercise-goal').value;
@@ -202,8 +255,7 @@
             
             saveCustomExercise(name, goal, isTimed, type);
         };
-
-        // --- WORKOUT SAVE/LOAD (Existing Logic) ---
+        
         function getWorkoutPath(sessionId) {
             return `artifacts/${appId}/users/${userId}/workout_sessions/${sessionId}`;
         }
@@ -216,6 +268,13 @@
             
             stopWorkoutTimer();
             currentWorkout.totalDuration = totalTimeSeconds;
+
+            if (!db) {
+                 showMessage("Database not initialized. Saving workout locally only (will not persist).", 'info');
+                 workoutHistory.unshift(JSON.parse(JSON.stringify(currentWorkout)));
+                 showMessage("Workout finished (Local save only). Start a new session.", 'success');
+                 return;
+            }
             
             const sessionData = {
                 date: currentWorkout.date,
@@ -237,7 +296,7 @@
         }
 
         async function loadHistory() {
-            if (!isAuthReady) return;
+            if (!isAuthReady || !db) return; 
 
             const collectionRef = collection(db, `artifacts/${appId}/users/${userId}/workout_sessions`);
             try {
@@ -250,7 +309,9 @@
                 });
 
                 workoutHistory = loadedData.sort((a, b) => new Date(b.date) - new Date(a.date));
-                renderHistory();
+                if (document.getElementById('history-view').classList.contains('hidden') === false) {
+                     renderHistory();
+                }
 
             } catch (error) {
                 console.error("Error loading history: ", error);
@@ -258,10 +319,12 @@
             }
         }
 
-        // --- APP LOGIC (Existing Logic) ---
-        function startNewSession(presetName) {
+
+        // --- APP LOGIC ---
+        function startNewSession(presetName, isCustom = false) {
             resetRestTimer();
             stopWorkoutTimer();
+            totalTimeSeconds = 0; 
             startWorkoutTimer();
             
             currentWorkout.id = crypto.randomUUID();
@@ -269,7 +332,13 @@
             currentWorkout.notes = '';
             currentWorkout.presetName = presetName;
             
-            const exerciseNames = PRESETS[presetName] || PRESETS['Full Body'];
+            let exerciseNames;
+            if (isCustom) {
+                exerciseNames = CUSTOM_PRESETS[presetName] || [];
+            } else {
+                exerciseNames = BASE_PRESETS[presetName] || BASE_PRESETS['Full Body'];
+            }
+            
             currentWorkout.exercises = exerciseNames.map(name => ({
                 name: name,
                 sets: [{}, {}, {}], 
@@ -277,266 +346,181 @@
                 type: EXERCISE_LIBRARY[name]?.type || "Misc"
             }));
             
-            // Initialize collapse state: expand the first one, collapse the rest (for better focus)
+            // Initialize collapse state
             exerciseCollapseState = currentWorkout.exercises.reduce((acc, _, index) => {
                 acc[index] = index === 0;
                 return acc;
             }, {});
-
 
             const notesElement = document.getElementById('session-notes');
             if (notesElement) notesElement.value = '';
 
             renderTracker();
             showMessage(`New '${presetName}' session started!`, 'info');
-            toggleSidebar(false); // Close sidebar on mobile
+            toggleSidebar(false); 
         }
 
-        function handleInputChange(exIndex, setIndex, field, value) {
-            let numValue = parseFloat(value);
-            if (field === 'reps' || field === 'weight') {
-                if (value === "") {
-                    numValue = null;
-                } else if (isNaN(numValue) || numValue < 0) {
-                    numValue = 0; 
-                }
-                currentWorkout.exercises[exIndex].sets[setIndex][field] = numValue;
-            }
-        }
-        
-        function handleNotesChange(value) {
-            currentWorkout.notes = value;
-        }
-        
-        function addExerciseToCurrentSession(name) {
-            if (!name) {
-                showMessage("Please select an exercise to add.", 'error');
-                return;
-            }
-            const exerciseData = EXERCISE_LIBRARY[name];
-            if (!exerciseData) {
-                 showMessage(`Exercise '${name}' not found in library.`, 'error');
-                return;
-            }
-
-            const newExIndex = currentWorkout.exercises.length;
-            currentWorkout.exercises.push({
-                name: name,
-                sets: [{}, {}, {}],
-                goal: exerciseData.goal,
-                type: exerciseData.type
-            });
-            currentWorkout.presetName = 'Custom';
-
-            // Automatically expand the newly added exercise
-            exerciseCollapseState[newExIndex] = true;
-
-            renderTracker();
-            showMessage(`Added ${name} to session.`, 'info');
-        }
-
-        function removeExerciseFromCurrentSession(exIndex) {
-            currentWorkout.exercises.splice(exIndex, 1);
-            currentWorkout.presetName = 'Custom';
-            
-            // Re-map collapse state keys after splice
-            const newCollapseState = {};
-            currentWorkout.exercises.forEach((_, index) => {
-                // Try to preserve state if the original index key existed for the remaining exercises
-                if (exerciseCollapseState[index] !== undefined) {
-                     newCollapseState[index] = exerciseCollapseState[index];
-                } else {
-                     newCollapseState[index] = true; // Default to open
-                }
-            });
-            exerciseCollapseState = newCollapseState;
-
-            renderTracker();
-            showMessage(`Exercise removed.`, 'info');
-        }
-
-        window.toggleExerciseCard = (exIndex) => {
-            exerciseCollapseState[exIndex] = !exerciseCollapseState[exIndex];
-            renderTracker(); 
+        window.startPreset = (name, isCustom) => {
+            startNewSession(name, isCustom);
         };
 
+        // --- UI RENDERING (Sidebar) ---
 
-        // --- REST TIMER LOGIC (Existing Logic) ---
-        function updateRestTimerDisplay() {
-            const display = document.getElementById('rest-timer-display');
-            const minutes = Math.floor(restTimeSeconds / 60);
-            const seconds = restTimeSeconds % 60;
-            display.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        function renderSidebarContent() {
+            const sidebar = document.getElementById('sidebar');
+            if (!sidebar) return;
 
-            const status = document.getElementById('rest-timer-status');
-            const button = document.getElementById('rest-timer-start-pause');
+            // 1. Build Exercise Dropdown Options
+            const exerciseNames = Object.keys(EXERCISE_LIBRARY).sort();
+            const exerciseOptions = exerciseNames.map(name => 
+                `<option value="${name}">${name} (${EXERCISE_LIBRARY[name].type}${EXERCISE_LIBRARY[name].isTimed ? ' - TIMED' : ''})</option>`
+            ).join('');
 
-            if (restTimeSeconds <= 0) {
-                clearInterval(restTimerInterval);
-                restTimerInterval = null;
-                // Add a blinking or prominent notification style
-                display.classList.add('bg-red-500', 'text-white', 'p-2', 'rounded', 'animate-pulse');
-                status.textContent = "REST TIME OVER!";
-                button.textContent = "Start Next Rest";
-                button.onclick = startRestTimer;
-            } else {
-                display.classList.remove('bg-red-500', 'text-white', 'p-2', 'rounded', 'animate-pulse');
-                status.textContent = "Resting...";
-            }
+            // 2. Build Preset Buttons
+            const basePresetsHTML = Object.keys(BASE_PRESETS).map(name => 
+                `<button onclick="window.startPreset('${name}', false)" class="p-2 bg-indigo-500 hover:bg-indigo-600 text-white font-bold rounded-lg shadow-sm transition text-sm">${name}</button>`
+            ).join('');
+
+            const customPresetsHTML = Object.keys(CUSTOM_PRESETS).length > 0 ? `
+                <h4 class="text-md font-semibold text-purple-700 mt-4 mb-2">My Custom Presets:</h4>
+                <div class="grid grid-cols-2 gap-2">
+                    ${Object.keys(CUSTOM_PRESETS).map(name => 
+                        `<button onclick="window.startPreset('${name}', true)" class="p-2 bg-purple-500 hover:bg-purple-600 text-white font-bold rounded-lg shadow-sm transition text-xs">${name}</button>`
+                    ).join('')}
+                </div>
+            ` : '';
+
+            sidebar.innerHTML = `
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-extrabold text-indigo-800">Control Panel</h2>
+                    <button onclick="window.toggleSidebar(false)" class="lg:hidden p-1 rounded-full text-gray-500 hover:text-gray-700">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                    </button>
+                </div>
+
+                <!-- 1. Start Session / Presets -->
+                <div class="mb-8 border-b pb-4">
+                    <h3 class="text-lg font-semibold text-gray-700 mb-3">Start New Session:</h3>
+                    <div class="grid grid-cols-2 gap-2">
+                        ${basePresetsHTML}
+                    </div>
+                    ${customPresetsHTML}
+                </div>
+
+                <!-- 2. Save Current as Preset -->
+                <div class="mb-8 p-3 bg-indigo-50 rounded-lg border border-indigo-200">
+                    <h3 class="text-lg font-semibold text-indigo-700 mb-3">Save Current as Preset</h3>
+                    <p class="text-xs text-gray-600 mb-2">Saves the current order of exercises.</p>
+                    <div class="space-y-2">
+                        <input type="text" id="new-preset-name" placeholder="Preset Name (e.g., Upper A)" class="w-full p-2 border rounded-md text-sm">
+                        <button onclick="window.handleSavePreset()"
+                                class="w-full p-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-md transition text-sm">
+                            Save Preset
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 3. Add Individual Exercise -->
+                <div class="mb-8 border-b pb-4">
+                    <h3 class="text-lg font-semibold text-gray-700 mb-3">Add Exercise to Current Session</h3>
+                    <div class="space-y-2">
+                        <select id="new-exercise-select" class="w-full p-2 border border-gray-300 rounded-md focus:border-indigo-500 transition text-sm">
+                            <option value="">-- Select Exercise --</option>
+                            ${exerciseOptions}
+                        </select>
+                        <button onclick="window.addExerciseToCurrentSession(document.getElementById('new-exercise-select').value)"
+                                class="w-full p-2 bg-purple-500 hover:bg-purple-600 text-white font-semibold rounded-lg shadow-md transition text-sm">
+                            + Add to Workout
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 4. Create Custom Exercise -->
+                <div class="mb-8 p-3 bg-gray-100 rounded-lg">
+                    <h3 class="text-lg font-semibold text-gray-700 mb-3">Create New Exercise</h3>
+                    <div class="space-y-3">
+                        <input type="text" id="custom-exercise-name" placeholder="Exercise Name (e.g., Weighted Sit-up)" class="w-full p-2 border rounded-md text-sm">
+                        <input type="text" id="custom-exercise-goal" placeholder="Goal (e.g., 3x10-15)" class="w-full p-2 border rounded-md text-sm">
+                        <input type="text" id="custom-exercise-type" placeholder="Type (e.g., Core, Back)" class="w-full p-2 border rounded-md text-sm">
+                        
+                        <div class="flex items-center">
+                            <input type="checkbox" id="custom-exercise-timed" class="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
+                            <label for="custom-exercise-timed" class="ml-2 block text-sm font-medium text-gray-700">
+                                Timed Exercise
+                            </label>
+                        </div>
+                        
+                        <button onclick="window.handleCreateCustomExercise()"
+                                class="w-full p-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-md transition text-sm">
+                            Save Custom Exercise
+                        </button>
+                    </div>
+                </div>
+            `;
         }
-
-        function startRestTimer() {
-            if (restTimerInterval) return; 
-            if (restTimeSeconds <= 0) {
-                restTimeSeconds = MAX_REST_TIME; 
-            }
-
-            document.getElementById('rest-timer-start-pause').textContent = "Pause";
-            document.getElementById('rest-timer-start-pause').onclick = pauseRestTimer;
-            
-            restTimerInterval = setInterval(() => {
-                restTimeSeconds--;
-                updateRestTimerDisplay();
-            }, 1000);
-        }
-
-        function pauseRestTimer() {
-            clearInterval(restTimerInterval);
-            restTimerInterval = null;
-            document.getElementById('rest-timer-start-pause').textContent = "Resume";
-            document.getElementById('rest-timer-start-pause').onclick = startRestTimer;
-            document.getElementById('rest-timer-status').textContent = "Paused";
-        }
-
-        function resetRestTimer() {
-            pauseRestTimer();
-            restTimeSeconds = MAX_REST_TIME;
-            updateRestTimerDisplay();
-            document.getElementById('rest-timer-start-pause').textContent = "Start";
-            document.getElementById('rest-timer-start-pause').onclick = startRestTimer;
-            document.getElementById('rest-timer-status').textContent = "Ready (90s)";
-        }
-
-        // --- TOTAL WORKOUT TIMER (Existing Logic) ---
-        function updateWorkoutTimerDisplay() {
-            const display = document.getElementById('workout-timer-display');
-            if (display) {
-                const hours = Math.floor(totalTimeSeconds / 3600);
-                const minutes = Math.floor((totalTimeSeconds % 3600) / 60);
-                const seconds = totalTimeSeconds % 60;
-                display.textContent = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-            }
-        }
-
-        function startWorkoutTimer() {
-            if (workoutTimerInterval) return;
-            // Note: totalTimeSeconds should persist if the workout is resumed
-            if (totalTimeSeconds === 0) {
-                 totalTimeSeconds = 0; // Initialize only on new session start
-            }
-            workoutTimerInterval = setInterval(() => {
-                totalTimeSeconds++;
-                updateWorkoutTimerDisplay();
-            }, 1000);
-        }
-
-        function stopWorkoutTimer() {
-            clearInterval(workoutTimerInterval);
-            workoutTimerInterval = null;
-        }
-
-        // --- LLM (Gemini API) LOGIC ---
         
-        // Helper function for exponential backoff (for retrying API calls)
-        async function fetchWithRetry(url, options, retries = 3) {
-            for (let i = 0; i < retries; i++) {
-                try {
-                    const response = await fetch(url, options);
-                    if (response.ok) {
-                        return response;
-                    } else if (response.status === 429 && i < retries - 1) { // Too Many Requests
-                        const delay = Math.pow(2, i) * 1000;
-                        await new Promise(resolve => setTimeout(resolve, delay));
-                        continue;
-                    } else {
-                        throw new Error(`API call failed with status: ${response.status}`);
-                    }
-                } catch (error) {
-                    if (i === retries - 1) {
-                        throw error;
-                    }
-                    const delay = Math.pow(2, i) * 1000;
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            }
-        }
+        // --- DRAG AND DROP HANDLERS ---
+        window.handleDragStart = (exIndex, event) => {
+            dragStartIndex = exIndex;
+            event.dataTransfer.effectAllowed = 'move';
+            // Set a unique data attribute to avoid drag issues
+            event.dataTransfer.setData('text/plain', exIndex);
+            setTimeout(() => {
+                event.target.classList.add('opacity-50', 'bg-indigo-100', 'shadow-xl');
+            }, 0);
+        };
 
+        window.handleDragOver = (event) => {
+            event.preventDefault(); // Necessary to allow drop
+            event.dataTransfer.dropEffect = 'move';
+        };
 
-        async function analyzeWorkout(workoutData) {
-            if (!API_KEY) {
-                showMessage("API Key is missing for analysis.", 'error');
-                const analysisContainer = document.getElementById('analysis-output');
-                analysisContainer.innerHTML = '<p class="text-red-500 font-semibold italic">Analysis requires a valid Gemini API Key.</p>';
-                return;
-            }
+        window.handleDragEnter = (event) => {
+            event.preventDefault();
+            const target = event.currentTarget;
+            target.classList.add('border-indigo-500', 'border-dashed');
+        };
 
-            const analysisContainer = document.getElementById('analysis-output');
-            analysisContainer.innerHTML = '<p class="text-indigo-500 font-semibold italic">Analyzing workout performance...</p>';
+        window.handleDragLeave = (event) => {
+            event.currentTarget.classList.remove('border-indigo-500', 'border-dashed');
+        };
+
+        window.handleDrop = (targetIndex, event) => {
+            event.preventDefault();
+            event.currentTarget.classList.remove('border-indigo-500', 'border-dashed');
             
-            // Format the workout data for the prompt
-            const workoutSummary = workoutData.exercises.map(ex => {
-                const isTimed = EXERCISE_LIBRARY[ex.name]?.isTimed || false;
-                const setDetails = ex.sets.map((set, i) => {
-                    if (set.reps !== null && set.reps !== undefined) {
-                        if (isTimed) {
-                            return `Set ${i+1}: ${set.reps} seconds`;
-                        } else {
-                            const weight = set.weight !== null && set.weight !== undefined ? `${set.weight}kg` : 'N/A weight';
-                            return `Set ${i+1}: ${set.reps} reps @ ${weight}`;
-                        }
-                    }
-                    return '';
-                }).filter(s => s).join('; ');
-                return `\n- ${ex.name} (${ex.goal}): ${setDetails}`;
-            }).join('');
+            const draggedIndex = parseInt(event.dataTransfer.getData('text/plain'));
             
-            const durationFormatted = formatDuration(workoutData.totalDuration);
-
-            const userQuery = `Analyze the following workout session data. Provide a brief analysis (2-3 paragraphs) focusing on: 1) Overall effort and completion rate, 2) Highlight any potential progression (e.g., consistency in reps/weight, or good time held for plank), and 3) Suggest one actionable tip for the next session. The session lasted ${durationFormatted}. Exercises performed: ${workoutSummary}\nNotes from the user: "${workoutData.notes}"`;
-
-            const systemPrompt = "You are a supportive, knowledgeable virtual strength coach. Provide concise, encouraging, and actionable feedback based only on the workout data provided. Use the tone of a professional personal trainer.";
-
-            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${API_KEY}`;
-            const payload = {
-                contents: [{ parts: [{ text: userQuery }] }],
-                systemInstruction: { parts: [{ text: systemPrompt }] },
-            };
-            
-            try {
-                const response = await fetchWithRetry(apiUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-
-                const result = await response.json();
-                const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (draggedIndex !== targetIndex && dragStartIndex !== -1) {
+                const exerciseToMove = currentWorkout.exercises[draggedIndex];
                 
-                if (text) {
-                    analysisContainer.innerHTML = `<p class="text-gray-700 whitespace-pre-wrap">${text}</p>`;
-                } else {
-                    analysisContainer.innerHTML = '<p class="text-red-500 italic">Analysis failed. Could not retrieve response from AI.</p>';
-                    console.error("Gemini API response issue:", result);
-                }
+                // Remove from old position and insert at new position
+                currentWorkout.exercises.splice(draggedIndex, 1);
+                currentWorkout.exercises.splice(targetIndex, 0, exerciseToMove);
+                
+                // Re-index collapse state
+                const newCollapseState = {};
+                currentWorkout.exercises.forEach((_, index) => {
+                    newCollapseState[index] = exerciseCollapseState[index] || false;
+                });
+                exerciseCollapseState = newCollapseState;
 
-            } catch (error) {
-                analysisContainer.innerHTML = `<p class="text-red-500 italic">Error connecting to the AI coach. Please check your API key and connection.</p>`;
-                console.error("Fetch error:", error);
+                renderTracker();
+                showMessage(`Moved ${exerciseToMove.name}`, 'info');
             }
-        }
-        
-        // --- UI RENDERING ---
+            dragStartIndex = -1; // Reset drag state
+        };
 
+        window.handleDragEnd = (event) => {
+            event.target.classList.remove('opacity-50', 'bg-indigo-100', 'shadow-xl');
+            dragStartIndex = -1;
+            // Ensure all elements lose the border in case of a failed drop
+            document.querySelectorAll('.exercise-draggable').forEach(el => {
+                el.classList.remove('border-indigo-500', 'border-dashed');
+            });
+        };
+
+        // --- UI RENDERING (Tracker) ---
         function renderTracker() {
             const container = document.getElementById('tracker-container');
             
@@ -547,10 +531,9 @@
                     <span class="text-sm">${new Date(currentWorkout.date).toLocaleDateString()}</span>
                 </div>
                 
-                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">Exercises</h3>
+                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">Exercises (Drag to reorder)</h3>
             `;
             
-            // Render Exercises
             currentWorkout.exercises.forEach((ex, exIndex) => {
                 const isTimed = EXERCISE_LIBRARY[ex.name]?.isTimed || false;
                 const isExpanded = exerciseCollapseState[exIndex];
@@ -559,7 +542,6 @@
                     let inputFields;
                     
                     if (isTimed) {
-                        // Timed Exercise (e.g., Plank)
                         inputFields = `
                             <input type="number" placeholder="Time Held" min="0" 
                                 value="${set.reps !== null && set.reps !== undefined ? set.reps : ''}" 
@@ -568,7 +550,6 @@
                             <span class="w-12 flex-shrink-0 text-gray-500 text-sm">secs</span>
                         `;
                     } else {
-                        // Reps/Weight Exercise (Standard)
                         inputFields = `
                             <input type="number" placeholder="Reps" min="0" 
                                 value="${set.reps !== null && set.reps !== undefined ? set.reps : ''}" 
@@ -590,26 +571,41 @@
                     `;
                 }).join('');
                 
+                const collapseClass = isExpanded ? 'collapsible-content expanded' : 'collapsible-content';
+
                 let exerciseHTML = `
-                    <div class="mb-6 p-4 bg-white rounded-xl shadow-lg border-l-4 border-indigo-500">
-                        <!-- Header with Collapse Toggle -->
-                        <div class="flex justify-between items-start mb-3 cursor-pointer" onclick="window.toggleExerciseCard(${exIndex})">
-                            <h3 class="text-xl font-bold text-gray-800 flex items-center">
-                                ${ex.name} 
-                                <span class="text-sm font-medium text-indigo-500 ml-2">${ex.goal}</span>
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 ml-2 text-gray-400 transform transition-transform duration-200" 
-                                    viewBox="0 0 20 20" fill="currentColor" style="transform: rotate(${isExpanded ? 0 : -90}deg);">
-                                    <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd" />
-                                </svg>
-                            </h3>
+                    <div class="exercise-draggable mb-6 p-4 bg-white rounded-xl shadow-lg border-l-4 border-indigo-500 transition-all duration-200" 
+                         draggable="true" 
+                         data-index="${exIndex}"
+                         ondragstart="window.handleDragStart(${exIndex}, event)"
+                         ondragover="window.handleDragOver(event)"
+                         ondragenter="window.handleDragEnter(event)"
+                         ondragleave="window.handleDragLeave(event)"
+                         ondrop="window.handleDrop(${exIndex}, event)"
+                         ondragend="window.handleDragEnd(event)">
+                        
+                        <div class="flex justify-between items-start mb-3">
+                            <div class="flex items-center flex-grow min-w-0">
+                                <span class="drag-handle text-gray-400 hover:text-indigo-600 cursor-move text-xl mr-2" title="Drag to reorder">
+                                    &#x2261;
+                                </span>
+                                <h3 class="text-xl font-bold text-gray-800 flex items-center min-w-0 flex-shrink truncate cursor-pointer" onclick="window.toggleExerciseCard(${exIndex})">
+                                    ${ex.name} 
+                                    <span class="text-sm font-medium text-indigo-500 ml-2">${ex.goal}</span>
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 ml-2 text-gray-400 transform transition-transform duration-200 flex-shrink-0" 
+                                        viewBox="0 0 20 20" fill="currentColor" style="transform: rotate(${isExpanded ? 0 : -90}deg);">
+                                        <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd" />
+                                    </svg>
+                                </h3>
+                            </div>
+
                             <button onclick="event.stopPropagation(); window.removeExerciseFromCurrentSession(${exIndex})"
-                                class="text-red-500 hover:text-red-700 font-semibold text-xs border border-red-500 rounded-full px-2 py-1 transition">
+                                class="text-red-500 hover:text-red-700 font-semibold text-xs border border-red-500 rounded-full px-2 py-1 transition flex-shrink-0 ml-4">
                                 Remove
                             </button>
                         </div>
                         
-                        <!-- Collapsible Content -->
-                        <div id="exercise-sets-${exIndex}" class="${isExpanded ? '' : 'hidden'} transition-all duration-300">
+                        <div id="exercise-sets-${exIndex}" class="${collapseClass}">
                             ${setInputsHTML}
                         </div>
                     </div>
@@ -617,7 +613,6 @@
                 container.innerHTML += exerciseHTML;
             });
             
-            // Add notes section
             container.innerHTML += `
                 <div class="mb-20 p-4 bg-white rounded-xl shadow-lg border-l-4 border-purple-500">
                     <h3 class="text-xl font-bold mb-3 text-gray-800">Session Notes (NSVs)</h3>
@@ -629,6 +624,70 @@
             
             document.getElementById('save-button').onclick = saveWorkout;
             updateWorkoutTimerDisplay();
+        }
+
+        // --- EXERCISE MANAGEMENT ---
+        function addExerciseToCurrentSession(name) {
+            if (!name) {
+                showMessage("Please select an exercise to add.", 'error');
+                return;
+            }
+            const exerciseData = EXERCISE_LIBRARY[name];
+            if (!exerciseData) {
+                 showMessage(`Exercise '${name}' not found in library.`, 'error');
+                return;
+            }
+
+            const newExIndex = currentWorkout.exercises.length;
+            currentWorkout.exercises.push({
+                name: name,
+                sets: [{}, {}, {}],
+                goal: exerciseData.goal,
+                type: exerciseData.type
+            });
+            currentWorkout.presetName = 'Custom';
+
+            exerciseCollapseState[newExIndex] = true;
+
+            renderTracker();
+            showMessage(`Added ${name} to session.`, 'info');
+        }
+
+        function removeExerciseFromCurrentSession(exIndex) {
+            currentWorkout.exercises.splice(exIndex, 1);
+            currentWorkout.presetName = 'Custom';
+            
+            // Re-index collapse state
+            const newCollapseState = {};
+            currentWorkout.exercises.forEach((_, index) => {
+                newCollapseState[index] = exerciseCollapseState[index] || false;
+            });
+            exerciseCollapseState = newCollapseState;
+
+            renderTracker();
+            showMessage(`Exercise removed.`, 'info');
+        }
+
+        window.toggleExerciseCard = (exIndex) => {
+            exerciseCollapseState[exIndex] = !exerciseCollapseState[exIndex];
+            renderTracker(); 
+        };
+
+        // --- HELPER FUNCTIONS ---
+        function handleInputChange(exIndex, setIndex, field, value) {
+            let numValue = parseFloat(value);
+            if (field === 'reps' || field === 'weight') {
+                if (value === "") {
+                    numValue = null;
+                } else if (isNaN(numValue) || numValue < 0) {
+                    numValue = 0; 
+                }
+                currentWorkout.exercises[exIndex].sets[setIndex][field] = numValue;
+            }
+        }
+        
+        function handleNotesChange(value) {
+            currentWorkout.notes = value;
         }
 
         function formatDuration(totalSeconds) {
@@ -645,10 +704,85 @@
             }
         }
 
+        function showMessage(text, type) {
+            const messageBox = document.getElementById('message-box');
+            if (!messageBox) return;
+
+            messageBox.textContent = text;
+            messageBox.className = 'p-3 rounded-lg text-white font-medium mb-4 transition-opacity duration-300';
+            messageBox.classList.add(type === 'success' ? 'bg-green-500' : type === 'error' ? 'bg-red-500' : 'bg-blue-500');
+            messageBox.style.opacity = 1;
+            setTimeout(() => {
+                messageBox.style.opacity = 0;
+            }, 3000);
+        }
+
+        function toggleSidebar(shouldOpen) {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            if (!sidebar || !overlay) return;
+            
+            const isMobile = window.innerWidth < 1024;
+            if (shouldOpen === undefined) {
+                shouldOpen = isMobile ? sidebar.classList.contains('-translate-x-full') : true;
+            }
+            
+            const isMobileView = window.innerWidth < 1024;
+
+            if (shouldOpen) {
+                if (isMobileView) {
+                    sidebar.classList.remove('-translate-x-full');
+                    sidebar.classList.add('translate-x-0');
+                    overlay.classList.remove('hidden');
+                }
+            } else {
+                 if (isMobileView) {
+                    sidebar.classList.add('-translate-x-full');
+                    sidebar.classList.remove('translate-x-0');
+                    overlay.classList.add('hidden');
+                 }
+            }
+        }
+        
+        function navigate(view) {
+            const trackerView = document.getElementById('tracker-view');
+            const historyView = document.getElementById('history-view');
+            const trackerTab = document.getElementById('tracker-tab');
+            const historyTab = document.getElementById('history-tab');
+            const saveButtonContainer = document.getElementById('save-button-container');
+
+            if (!trackerView || !historyView || !trackerTab || !historyTab || !saveButtonContainer) return;
+
+            if (view === 'tracker') {
+                trackerView.classList.remove('hidden');
+                historyView.classList.add('hidden');
+                trackerTab.classList.add('bg-indigo-700', 'text-white');
+                trackerTab.classList.remove('bg-gray-200', 'text-gray-700');
+                historyTab.classList.remove('bg-indigo-700', 'text-white');
+                historyTab.classList.add('bg-gray-200', 'text-gray-700');
+                saveButtonContainer.classList.remove('hidden');
+                renderTracker();
+            } else {
+                trackerView.classList.add('hidden');
+                historyView.classList.remove('hidden');
+                historyTab.classList.add('bg-indigo-700', 'text-white');
+                historyTab.classList.remove('bg-gray-200', 'text-gray-700');
+                trackerTab.classList.remove('bg-indigo-700', 'text-white');
+                trackerTab.classList.add('bg-gray-200', 'text-gray-700');
+                saveButtonContainer.classList.add('hidden');
+                
+                loadHistory(); 
+            }
+        }
+
+        // --- HISTORY RENDERING ---
         function renderHistory() {
             const container = document.getElementById('history-container');
-            const analysisPanel = document.getElementById('analysis-panel');
-            analysisPanel.classList.add('hidden'); // Hide analysis panel when viewing history list
+
+            if (!db) {
+                container.innerHTML = '<p class="text-gray-500 italic text-center p-4">History is disabled in Local Mode. Start a session to try the tracker!</p>';
+                return;
+            }
 
             if (workoutHistory.length === 0) {
                 container.innerHTML = '<p class="text-gray-500 italic text-center p-4">No workout history found yet. Complete a session to see it here!</p>';
@@ -680,8 +814,6 @@
             if (!session) return;
 
             const container = document.getElementById('history-container');
-            const analysisPanel = document.getElementById('analysis-panel');
-            const analysisOutput = document.getElementById('analysis-output');
             
             container.innerHTML = `
                 <button onclick="window.navigate('history')" class="mb-4 text-indigo-600 hover:text-indigo-800 font-semibold flex items-center">
@@ -723,141 +855,100 @@
                     </div>
                 </div>
             `;
-            
-            analysisPanel.classList.remove('hidden');
-            analysisOutput.innerHTML = '<p class="text-indigo-500 font-semibold italic">Tap "Analyze" to get feedback from the AI coach.</p>';
-            
-            // Set up the Analyze button
-            document.getElementById('analyze-button').onclick = () => analyzeWorkout(session);
         }
 
-        function showMessage(text, type) {
-            const messageBox = document.getElementById('message-box');
-            messageBox.textContent = text;
-            messageBox.className = 'p-3 rounded-lg text-white font-medium mb-4 transition-opacity duration-300';
-            messageBox.classList.add(type === 'success' ? 'bg-green-500' : type === 'error' ? 'bg-red-500' : 'bg-blue-500');
-            messageBox.style.opacity = 1;
-            setTimeout(() => {
-                messageBox.style.opacity = 0;
-            }, 3000);
-        }
-        
-        // --- NAVIGATION & SIDEBAR ---
-        function toggleSidebar(shouldOpen) {
-            const sidebar = document.getElementById('sidebar');
-            const overlay = document.getElementById('sidebar-overlay');
+        // --- TIMER LOGIC ---
+        function updateRestTimerDisplay() {
+            const display = document.getElementById('rest-timer-display');
+            const minutes = Math.floor(restTimeSeconds / 60);
+            const seconds = restTimeSeconds % 60;
+            display.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+
+            const status = document.getElementById('rest-timer-status');
+            const button = document.getElementById('rest-timer-start-pause');
             
-            if (shouldOpen === undefined) {
-                shouldOpen = sidebar.classList.contains('-translate-x-full');
-            }
-            
-            if (shouldOpen) {
-                sidebar.classList.remove('-translate-x-full');
-                sidebar.classList.add('translate-x-0');
-                overlay.classList.remove('hidden');
+            if (!display || !status || !button) return;
+
+            if (restTimeSeconds <= 0) {
+                clearInterval(restTimerInterval);
+                restTimerInterval = null;
+                display.classList.add('bg-red-500', 'text-white', 'p-2', 'rounded', 'animate-pulse');
+                status.textContent = "REST TIME OVER!";
+                button.textContent = "Start Next Rest";
+                button.onclick = startRestTimer;
             } else {
-                sidebar.classList.add('-translate-x-full');
-                sidebar.classList.remove('translate-x-0');
-                overlay.classList.add('hidden');
+                display.classList.remove('bg-red-500', 'text-white', 'p-2', 'rounded', 'animate-pulse');
+                status.textContent = "Resting...";
             }
         }
 
-        function navigate(view) {
-            const trackerView = document.getElementById('tracker-view');
-            const historyView = document.getElementById('history-view');
-            const trackerTab = document.getElementById('tracker-tab');
-            const historyTab = document.getElementById('history-tab');
-            const saveButtonContainer = document.getElementById('save-button-container');
+        function startRestTimer() {
+            if (restTimerInterval) return; 
+            if (restTimeSeconds <= 0) {
+                restTimeSeconds = MAX_REST_TIME; 
+            }
 
-            if (view === 'tracker') {
-                trackerView.classList.remove('hidden');
-                historyView.classList.add('hidden');
-                trackerTab.classList.add('bg-indigo-700', 'text-white');
-                trackerTab.classList.remove('bg-gray-200', 'text-gray-700');
-                historyTab.classList.remove('bg-indigo-700', 'text-white');
-                historyTab.classList.add('bg-gray-200', 'text-gray-700');
-                document.getElementById('analysis-panel').classList.add('hidden');
-                saveButtonContainer.classList.remove('hidden');
-            } else {
-                trackerView.classList.add('hidden');
-                historyView.classList.remove('hidden');
-                historyTab.classList.add('bg-indigo-700', 'text-white');
-                historyTab.classList.remove('bg-gray-200', 'text-gray-700');
-                trackerTab.classList.remove('bg-indigo-700', 'text-white');
-                trackerTab.classList.add('bg-gray-200', 'text-gray-700');
-                saveButtonContainer.classList.add('hidden');
-                
-                loadHistory(); 
+            const button = document.getElementById('rest-timer-start-pause');
+            if (button) {
+                button.textContent = "Pause";
+                button.onclick = pauseRestTimer;
+            }
+            
+            restTimerInterval = setInterval(() => {
+                restTimeSeconds--;
+                updateRestTimerDisplay();
+            }, 1000);
+        }
+
+        function pauseRestTimer() {
+            clearInterval(restTimerInterval);
+            restTimerInterval = null;
+            const button = document.getElementById('rest-timer-start-pause');
+            if (button) {
+                button.textContent = "Resume";
+                button.onclick = startRestTimer;
+            }
+            const status = document.getElementById('rest-timer-status');
+            if (status) status.textContent = "Paused";
+        }
+
+        function resetRestTimer() {
+            pauseRestTimer();
+            restTimeSeconds = MAX_REST_TIME;
+            updateRestTimerDisplay();
+            const button = document.getElementById('rest-timer-start-pause');
+            if (button) {
+                button.textContent = "Start";
+                button.onclick = startRestTimer;
+            }
+            const status = document.getElementById('rest-timer-status');
+            if (status) status.textContent = "Ready (90s)";
+        }
+
+        function updateWorkoutTimerDisplay() {
+            const display = document.getElementById('workout-timer-display');
+            if (display) {
+                const hours = Math.floor(totalTimeSeconds / 3600);
+                const minutes = Math.floor((totalTimeSeconds % 3600) / 60);
+                const seconds = totalTimeSeconds % 60;
+                display.textContent = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
             }
         }
-        
-        function renderSidebarContent() {
-            const sidebar = document.getElementById('sidebar');
 
-            // Build exercise customization dropdown options
-            const exerciseNames = Object.keys(EXERCISE_LIBRARY).sort();
-            const exerciseOptions = exerciseNames.map(name => 
-                `<option value="${name}">${name} (${EXERCISE_LIBRARY[name].type}${EXERCISE_LIBRARY[name].isTimed ? ' - TIMED' : ''})</option>`
-            ).join('');
-
-            sidebar.innerHTML = `
-                <div class="flex justify-between items-center mb-6">
-                    <h2 class="text-2xl font-extrabold text-indigo-800">Control Panel</h2>
-                    <button onclick="window.toggleSidebar(false)" class="lg:hidden text-gray-500 hover:text-gray-700">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
-                    </button>
-                </div>
-
-                <!-- 1. Presets -->
-                <div class="mb-8 border-b pb-4">
-                    <h3 class="text-lg font-semibold text-gray-700 mb-3">Start New Session:</h3>
-                    <div class="grid grid-cols-2 gap-2">
-                        <button onclick="window.startNewSession('Full Body')" class="p-2 bg-indigo-500 hover:bg-indigo-600 text-white font-bold rounded-lg shadow-sm transition text-sm">Full Body</button>
-                        <button onclick="window.startNewSession('Push')" class="p-2 bg-red-500 hover:bg-red-600 text-white font-bold rounded-lg shadow-sm transition text-sm">Push Day</button>
-                        <button onclick="window.startNewSession('Pull')" class="p-2 bg-yellow-500 hover:bg-yellow-600 text-white font-bold rounded-lg shadow-sm transition text-sm">Pull Day</button>
-                        <button onclick="window.startNewSession('Legs')" class="p-2 bg-blue-500 hover:bg-blue-600 text-white font-bold rounded-lg shadow-sm transition text-sm">Legs Day</button>
-                    </div>
-                </div>
-
-                <!-- 2. Add Exercise -->
-                <div class="mb-8 border-b pb-4">
-                    <h3 class="text-lg font-semibold text-gray-700 mb-3">Add Exercise to Current Session</h3>
-                    <div class="space-y-2">
-                        <select id="new-exercise-select" class="w-full p-2 border border-gray-300 rounded-md focus:border-indigo-500 transition text-sm">
-                            <option value="">-- Select Exercise --</option>
-                            ${exerciseOptions}
-                        </select>
-                        <button onclick="window.addExerciseToCurrentSession(document.getElementById('new-exercise-select').value)"
-                                class="w-full p-2 bg-purple-500 hover:bg-purple-600 text-white font-semibold rounded-lg shadow-md transition text-sm">
-                            + Add to Workout
-                        </button>
-                    </div>
-                </div>
-
-                <!-- 3. Create Custom Exercise -->
-                <div class="mb-8 p-3 bg-gray-100 rounded-lg">
-                    <h3 class="text-lg font-semibold text-gray-700 mb-3">Create New Exercise</h3>
-                    <div class="space-y-3">
-                        <input type="text" id="custom-exercise-name" placeholder="Exercise Name (e.g., Weighted Sit-up)" class="w-full p-2 border rounded-md text-sm">
-                        <input type="text" id="custom-exercise-goal" placeholder="Goal (e.g., 3x10-15)" class="w-full p-2 border rounded-md text-sm">
-                        <input type="text" id="custom-exercise-type" placeholder="Type (e.g., Core, Back)" class="w-full p-2 border rounded-md text-sm">
-                        
-                        <div class="flex items-center">
-                            <input type="checkbox" id="custom-exercise-timed" class="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
-                            <label for="custom-exercise-timed" class="ml-2 block text-sm font-medium text-gray-700">
-                                Timed Exercise (No weight/reps needed)
-                            </label>
-                        </div>
-                        
-                        <button onclick="window.handleCreateCustomExercise()"
-                                class="w-full p-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-md transition text-sm">
-                            Save Custom Exercise
-                        </button>
-                    </div>
-                </div>
-            `;
+        function startWorkoutTimer() {
+            if (workoutTimerInterval) return;
+            workoutTimerInterval = setInterval(() => {
+                totalTimeSeconds++;
+                updateWorkoutTimerDisplay();
+            }, 1000);
         }
-        
+
+        function stopWorkoutTimer() {
+            clearInterval(workoutTimerInterval);
+            workoutTimerInterval = null;
+        }
+
+
         // --- WINDOW LOAD & INIT ---
         window.onload = () => {
             initializeFirebase();
@@ -866,12 +957,15 @@
             window.handleInputChange = handleInputChange;
             window.handleNotesChange = handleNotesChange;
             window.navigate = navigate;
-            window.startNewSession = startNewSession;
-            window.startRestTimer = startRestTimer;
-            window.resetRestTimer = resetRestTimer;
             window.addExerciseToCurrentSession = addExerciseToCurrentSession;
             window.removeExerciseFromCurrentSession = removeExerciseFromCurrentSession;
             window.toggleSidebar = toggleSidebar;
+            
+            // Timers
+            window.startRestTimer = startRestTimer;
+            window.resetRestTimer = resetRestTimer;
+
+            // History
             window.viewSessionDetail = viewSessionDetail;
             window.toggleExerciseCard = toggleExerciseCard;
             
@@ -904,23 +998,20 @@
             -moz-appearance: textfield;
         }
         
-        /* Ensure main content is full width on mobile when sidebar is closed */
         @media (max-width: 1023px) {
             #main-content {
                 width: 100%;
-                /* Add padding bottom for the fixed save button on mobile */
                 padding-bottom: 5rem; 
             }
         }
         
-        /* Transition utility for collapsible content (needed since Tailwind's hidden doesn't animate easily) */
         .collapsible-content {
             max-height: 0;
             overflow: hidden;
             transition: max-height 0.3s ease-out;
         }
         .collapsible-content.expanded {
-            max-height: 500px; /* Large enough value to cover content */
+            max-height: 500px; 
             transition: max-height 0.3s ease-in;
         }
         
@@ -931,6 +1022,13 @@
         .animate-pulse {
             animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
         }
+
+        .exercise-draggable {
+            border: 2px solid transparent; /* default state */
+        }
+        .exercise-draggable[draggable="true"]:hover .drag-handle {
+            color: #4f46e5; /* Tailwind indigo-600 */
+        }
     </style>
 </head>
 <body class="min-h-screen">
@@ -940,7 +1038,9 @@
 
     <div class="flex">
         <!-- Sidebar / Off-Canvas Menu -->
-        <div id="sidebar" class="fixed top-0 left-0 w-64 h-full bg-white z-50 shadow-2xl transform -translate-x-full transition-transform duration-300 p-4 overflow-y-auto lg:relative lg:translate-x-0 lg:w-72 lg:flex-shrink-0 lg:border-r lg:shadow-none">
+        <div id="sidebar" 
+             class="fixed top-0 left-0 w-64 h-full bg-white z-50 shadow-2xl transform transition-transform duration-300 p-4 overflow-y-auto 
+                    -translate-x-full lg:translate-x-0 lg:relative lg:w-72 lg:flex-shrink-0 lg:border-r lg:shadow-none">
             <!-- Sidebar content rendered by renderSidebarContent() -->
         </div>
 
@@ -952,8 +1052,8 @@
                     <button onclick="window.toggleSidebar(true)" class="lg:hidden p-2 rounded-full bg-indigo-500 text-white shadow-lg">
                         <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" /></svg>
                     </button>
-                    <h1 class="text-3xl font-extrabold text-indigo-800 lg:text-center">Strength Tracker V4</h1>
-                    <div class="w-8 lg:hidden"></div> <!-- Spacer for symmetry -->
+                    <h1 class="text-3xl font-extrabold text-indigo-800 lg:text-center">Strength Tracker V6</h1>
+                    <div class="w-8 lg:hidden"></div> 
                 </header>
 
                 <!-- Auth Status -->
@@ -979,13 +1079,11 @@
                     
                     <!-- Timers Container -->
                     <div class="grid grid-cols-2 gap-4 mb-6">
-                        <!-- Total Workout Timer (Chronometer) -->
                         <div class="p-4 bg-white rounded-xl shadow-lg border-b-4 border-green-500 text-center">
                             <h2 class="text-sm font-bold text-green-600 mb-1">Total Session Time</h2>
                             <span id="workout-timer-display" class="text-2xl font-extrabold text-gray-800 md:text-3xl">00:00:00</span>
                         </div>
 
-                        <!-- Rest Timer Component -->
                         <div class="p-4 bg-white rounded-xl shadow-lg border-b-4 border-indigo-400 text-center">
                             <h2 class="text-sm font-bold text-indigo-600 mb-1">Rest Timer (90s)</h2>
                             <span id="rest-timer-display" class="text-2xl font-extrabold text-gray-800 md:text-3xl">01:30</span>
@@ -1003,7 +1101,6 @@
                         <!-- Exercises will be rendered here -->
                     </div>
 
-                    <!-- The Save button will be fixed to the bottom of the screen on mobile -->
                 </div>
 
                 <!-- History Log View -->
@@ -1011,19 +1108,6 @@
                     <h3 class="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Recent Sessions</h3>
                     <div id="history-container" class="space-y-4">
                         <!-- History list or detail view rendered here -->
-                    </div>
-
-                    <!-- AI Analysis Panel (Hidden initially) -->
-                    <div id="analysis-panel" class="hidden mt-8 p-4 bg-white rounded-xl shadow-lg border-l-4 border-yellow-500">
-                        <div class="flex justify-between items-center mb-3 border-b pb-2">
-                            <h4 class="text-xl font-bold text-yellow-700">AI Coach Analysis</h4>
-                            <button id="analyze-button" class="py-1 px-4 bg-yellow-500 hover:bg-yellow-600 text-white font-semibold rounded-lg shadow-md transition text-sm">
-                                Analyze
-                            </button>
-                        </div>
-                        <div id="analysis-output">
-                            <p class="text-gray-500 italic">Tap "Analyze" after selecting a session to get feedback from the AI coach.</p>
-                        </div>
                     </div>
                 </div>
 
